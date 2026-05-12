@@ -42,8 +42,34 @@ async fn async_run() -> Result<()> {
     let keys_content = tokio::fs::read_to_string(&cfg.keys_file).await
         .map_err(|e| anyhow::anyhow!("读取密钥文件 {:?} 失败: {}", cfg.keys_file, e))?;
     let keys_raw: serde_json::Value = serde_json::from_str(&keys_content)?;
-    let all_keys = extract_keys(&keys_raw);
+    let mut all_keys = extract_keys(&keys_raw);
     eprintln!("[daemon] 密钥数量: {}", all_keys.len());
+
+    // 扫描磁盘上未在 all_keys 中的消息库，使用同组密钥
+    // 所有 message/message_N.db 共享同一份加密密钥
+    let message_dir = cfg.db_dir.join("message");
+    if message_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&message_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                if file_name.starts_with("message_") && file_name.ends_with(".db")
+                    && !file_name.contains("_fts") && !file_name.contains("_resource")
+                {
+                    let rel_key = format!("message/{}", file_name);
+                    if !all_keys.contains_key(&rel_key) {
+                        if let Some(key) = all_keys.values().next().cloned() {
+                            eprintln!("[daemon] 自动发现消息库: {} (使用同组密钥)", rel_key);
+                            all_keys.insert(rel_key, key);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // 初始化 DbCache
     let db = Arc::new(cache::DbCache::new(cfg.db_dir.clone(), all_keys.clone()).await?);
